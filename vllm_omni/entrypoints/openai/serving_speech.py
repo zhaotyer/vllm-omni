@@ -45,7 +45,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Initialize uploaded speakers storage
-        self.uploaded_speakers_dir = Path("/tmp/voice_samples")
+        speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        self.uploaded_speakers_dir = Path(speech_voice_samples_dir)
         self.uploaded_speakers_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.uploaded_speakers_dir / "metadata.json"
         
