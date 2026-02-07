@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import re
 import time
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,41 @@ _TTS_LANGUAGES: set[str] = {
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal attacks.
+    
+    Only allows alphanumeric characters, underscores, hyphens, and dots.
+    Replaces any other characters with underscores.
+    """
+    # Remove any path components
+    filename = os.path.basename(filename)
+    # Replace any non-alphanumeric, underscore, hyphen, or dot with underscore
+    sanitized = re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)
+    # Ensure filename is not empty
+    if not sanitized:
+        sanitized = "file"
+    # Limit length to prevent potential issues
+    if len(sanitized) > 255:
+        sanitized = sanitized[:255]
+    return sanitized
+
+
+def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
+    """Validate that file_path is within the specified directory.
+    
+    Prevents path traversal attacks by ensuring the resolved path
+    is within the target directory.
+    """
+    try:
+        # Resolve both paths to absolute paths
+        file_path_resolved = file_path.resolve()
+        directory_resolved = directory.resolve()
+        # Check if file_path is within directory
+        return directory_resolved in file_path_resolved.parents or directory_resolved == file_path_resolved
+    except Exception:
+        return False
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -114,8 +151,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None
         
         try:
-            import base64
-            
             # Read audio file
             with open(file_path, 'rb') as f:
                 audio_bytes = f.read()
@@ -181,11 +216,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if voice_name_lower in self.uploaded_speakers:
             raise ValueError(f"Voice '{name}' already exists")
         
-        # Generate filename
+        # Sanitize name and consent to prevent path traversal
+        sanitized_name = _sanitize_filename(name)
+        sanitized_consent = _sanitize_filename(consent)
+        
+        # Generate filename with sanitized inputs
         timestamp = int(time.time())
-        file_ext = audio_file.filename.split('.')[-1] if '.' in audio_file.filename else "wav"
-        filename = f"{name}_{consent}_{timestamp}.{file_ext}"
+        file_suffix = Path(audio_file.filename).suffix
+        file_ext = file_suffix[1:] if file_suffix and len(file_suffix) > 1 else "wav"
+        # Sanitize file extension as well
+        sanitized_ext = _sanitize_filename(file_ext)
+        if not sanitized_ext or sanitized_ext == "file":
+            sanitized_ext = "wav"
+        
+        filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
         file_path = self.uploaded_speakers_dir / filename
+        
+        # Double-check that the path is within the upload directory
+        if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
+            raise ValueError(f"Invalid file path: potential path traversal attack detected")
         
         # Save audio file
         try:
@@ -214,10 +263,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         
         logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
         
+        # Return voice information without exposing the server file path
         return {
             "name": name,
             "consent": consent,
-            "file_path": str(file_path),
             "created_at": timestamp,
             "mime_type": mime_type,
             "file_size": file_size
@@ -255,12 +304,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
-        if task_type == "Base" and request.voice is None:
-            if request.ref_audio is None:
-                return "Base task requires 'ref_audio' for voice cloning"
-            # Validate ref_audio format
-            if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
-                return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+        if task_type == "Base":
+            if request.voice is None:
+                if request.ref_audio is None:
+                    return "Base task requires 'ref_audio' for voice cloning"
+                # Validate ref_audio format
+                if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
+                    return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+            else:
+                 # voice is not None
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers:
+                    pass
+                else:
+                    # need ref_audio
+                    if request.ref_audio is None:
+                        return f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
@@ -324,6 +383,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     params["ref_audio"] = [audio_data]
                     params["x_vector_only_mode"] = [True]
                     logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
+                else:
+                    raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+                
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
 
