@@ -1,7 +1,13 @@
 import asyncio
+import base64
+import json
+import os
+import re
+import time
+from pathlib import Path
 from typing import Any
 
-from fastapi import Request
+from fastapi import Request, UploadFile
 from fastapi.responses import Response
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
@@ -37,12 +43,59 @@ _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 
 
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal attacks.
+
+    Only allows alphanumeric characters, underscores, hyphens, and dots.
+    Replaces any other characters with underscores.
+    """
+    # Remove any path components
+    filename = os.path.basename(filename)
+    # Replace any non-alphanumeric, underscore, hyphen, or dot with underscore
+    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
+    # Ensure filename is not empty
+    if not sanitized:
+        sanitized = "file"
+    # Limit length to prevent potential issues
+    if len(sanitized) > 255:
+        sanitized = sanitized[:255]
+    return sanitized
+
+
+def _validate_path_within_directory(file_path: Path, directory: Path) -> bool:
+    """Validate that file_path is within the specified directory.
+
+    Prevents path traversal attacks by ensuring the resolved path
+    is within the target directory.
+    """
+    try:
+        # Resolve both paths to absolute paths
+        file_path_resolved = file_path.resolve()
+        directory_resolved = directory.resolve()
+        # Check if file_path is within directory
+        return directory_resolved in file_path_resolved.parents or directory_resolved == file_path_resolved
+    except Exception:
+        return False
+
+
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Initialize uploaded speakers storage
+        speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
+        self.uploaded_speakers_dir = Path(speech_voice_samples_dir)
+        self.uploaded_speakers_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_file = self.uploaded_speakers_dir / "metadata.json"
+
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
+        # Load uploaded speakers
+        self.uploaded_speakers = self._load_uploaded_speakers()
+        # Merge supported speakers with uploaded speakers
+        self.supported_speakers.update(self.uploaded_speakers.keys())
+
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+        logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -61,6 +114,172 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning(f"Could not load speakers from model config: {e}")
 
         return set()
+
+    def _load_uploaded_speakers(self) -> dict[str, dict]:
+        """Load uploaded speakers from metadata file."""
+        if not self.metadata_file.exists():
+            return {}
+
+        try:
+            with open(self.metadata_file) as f:
+                metadata = json.load(f)
+            return metadata.get("uploaded_speakers", {})
+        except Exception as e:
+            logger.warning(f"Could not load uploaded speakers metadata: {e}")
+            return {}
+
+    def _save_uploaded_speakers(self) -> None:
+        """Save uploaded speakers to metadata file."""
+        try:
+            metadata = {"uploaded_speakers": self.uploaded_speakers}
+            with open(self.metadata_file, "w") as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save uploaded speakers metadata: {e}")
+
+    def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
+        """Get base64 encoded audio data for uploaded voice."""
+        voice_name_lower = voice_name.lower()
+        if voice_name_lower not in self.uploaded_speakers:
+            return None
+
+        speaker_info = self.uploaded_speakers[voice_name_lower]
+        file_path = Path(speaker_info["file_path"])
+
+        if not file_path.exists():
+            logger.warning(f"Audio file not found for voice {voice_name}: {file_path}")
+            return None
+
+        try:
+            # Read audio file
+            with open(file_path, "rb") as f:
+                audio_bytes = f.read()
+
+            # Encode to base64
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+            # Get MIME type from file extension
+            mime_type = speaker_info.get("mime_type", "audio/wav")
+
+            # Return as data URL
+            return f"data:{mime_type};base64,{audio_b64}"
+        except Exception as e:
+            logger.error(f"Could not read audio file for voice {voice_name}: {e}")
+            return None
+
+    async def upload_voice(self, audio_file: UploadFile, consent: str, name: str) -> dict:
+        """Upload a new voice sample."""
+        # Validate file size (max 10MB)
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+        audio_file.file.seek(0, 2)  # Seek to end
+        file_size = audio_file.file.tell()
+        audio_file.file.seek(0)  # Reset to beginning
+
+        if file_size > MAX_FILE_SIZE:
+            raise ValueError(f"File size exceeds maximum limit of 10MB. Got {file_size} bytes.")
+
+        # Detect MIME type from filename if content_type is generic
+        mime_type = audio_file.content_type
+        if mime_type == "application/octet-stream":
+            # Simple MIME type detection based on file extension
+            filename_lower = audio_file.filename.lower()
+            if filename_lower.endswith(".wav"):
+                mime_type = "audio/wav"
+            elif filename_lower.endswith((".mp3", ".mpeg")):
+                mime_type = "audio/mpeg"
+            elif filename_lower.endswith(".flac"):
+                mime_type = "audio/flac"
+            elif filename_lower.endswith(".ogg"):
+                mime_type = "audio/ogg"
+            elif filename_lower.endswith(".aac"):
+                mime_type = "audio/aac"
+            elif filename_lower.endswith(".webm"):
+                mime_type = "audio/webm"
+            elif filename_lower.endswith(".mp4"):
+                mime_type = "audio/mp4"
+            else:
+                mime_type = "audio/wav"  # Default
+
+        # Validate MIME type
+        allowed_mime_types = {
+            "audio/mpeg",
+            "audio/wav",
+            "audio/x-wav",
+            "audio/ogg",
+            "audio/aac",
+            "audio/flac",
+            "audio/webm",
+            "audio/mp4",
+        }
+
+        if mime_type not in allowed_mime_types:
+            raise ValueError(f"Unsupported MIME type: {mime_type}. Allowed: {allowed_mime_types}")
+
+        # Normalize voice name
+        voice_name_lower = name.lower()
+
+        # Check if voice already exists
+        if voice_name_lower in self.uploaded_speakers:
+            raise ValueError(f"Voice '{name}' already exists")
+
+        # Sanitize name and consent to prevent path traversal
+        sanitized_name = _sanitize_filename(name)
+        sanitized_consent = _sanitize_filename(consent)
+
+        # Generate filename with sanitized inputs
+        timestamp = int(time.time())
+        file_suffix = Path(audio_file.filename).suffix
+        file_ext = file_suffix[1:] if file_suffix and len(file_suffix) > 1 else "wav"
+        # Sanitize file extension as well
+        sanitized_ext = _sanitize_filename(file_ext)
+        if not sanitized_ext or sanitized_ext == "file":
+            sanitized_ext = "wav"
+
+        filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.{sanitized_ext}"
+        file_path = self.uploaded_speakers_dir / filename
+
+        # Double-check that the path is within the upload directory
+        if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
+            raise ValueError("Invalid file path: potential path traversal attack detected")
+
+        # Save audio file
+        try:
+            with open(file_path, "wb") as f:
+                content = await audio_file.read()
+                f.write(content)
+        except Exception as e:
+            raise ValueError(f"Failed to save audio file: {e}")
+
+        # Update metadata
+        self.uploaded_speakers[voice_name_lower] = {
+            "name": name,
+            "consent": consent,
+            "file_path": str(file_path),
+            "created_at": timestamp,
+            "mime_type": mime_type,
+            "original_filename": audio_file.filename,
+            "file_size": file_size,
+            "cache_status": "pending",  # 初始缓存状态为 pending
+            "cache_file": None,  # 初始缓存文件为空
+            "cache_generated_at": None,  # 初始缓存生成时间为空
+        }
+
+        # Update supported speakers
+        self.supported_speakers.add(voice_name_lower)
+
+        # Save metadata
+        self._save_uploaded_speakers()
+
+        logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
+
+        # Return voice information without exposing the server file path
+        return {
+            "name": name,
+            "consent": consent,
+            "created_at": timestamp,
+            "mime_type": mime_type,
+            "file_size": file_size,
+        }
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -95,11 +314,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Validate Base task requirements
         if task_type == "Base":
-            if request.ref_audio is None:
-                return "Base task requires 'ref_audio' for voice cloning"
-            # Validate ref_audio format
-            if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
-                return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+            if request.voice is None:
+                if request.ref_audio is None:
+                    return "Base task requires 'ref_audio' for voice cloning"
+                # Validate ref_audio format
+                if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
+                    return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
+            else:
+                # voice is not None
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers:
+                    pass
+                else:
+                    # need ref_audio
+                    if request.ref_audio is None:
+                        return (
+                            f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
+                        )
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
@@ -155,6 +386,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Speaker (voice)
         if request.voice is not None:
             params["speaker"] = [request.voice]
+
+            # If voice is an uploaded speaker and no ref_audio provided, auto-set it
+            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
+                audio_data = self._get_uploaded_audio_data(request.voice)
+                if audio_data:
+                    params["ref_audio"] = [audio_data]
+                    params["x_vector_only_mode"] = [True]
+                    logger.info(f"Auto-set ref_audio for uploaded voice: {request.voice}")
+                else:
+                    raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
+
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
 
