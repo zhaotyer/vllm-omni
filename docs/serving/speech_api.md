@@ -12,7 +12,10 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8000 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 ### Generate Speech
@@ -20,7 +23,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 **Using curl:**
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -35,7 +38,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 import httpx
 
 response = httpx.post(
-    "http://localhost:8000/v1/audio/speech",
+    "http://localhost:8091/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
         "voice": "vivian",
@@ -53,7 +56,7 @@ with open("output.wav", "wb") as f:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
 
 response = client.audio.speech.create(
     model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
@@ -105,8 +108,11 @@ Content-Type: application/json
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
 ### Response Format
+
 Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
+
 ### Voices Endpoint
+
 ```
 GET /v1/audio/voices
 ```
@@ -115,10 +121,9 @@ Lists available voices for the loaded model.
 
 ```json
 {
-    "voices": ["aiden", "dylan", "eric", "one_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
+    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
 }
 ```
-
 ```
 POST /v1/audio/voices
 Content-Type: multipart/form-data
@@ -153,19 +158,18 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 **Usage Example:**
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/voices \
+curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1"
 ```
-
 
 ## Examples
 
 ### CustomVoice with Style Instruction
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "I am so excited!",
@@ -180,11 +184,14 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 # Start server with VoiceDesign model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8000 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello world",
@@ -199,11 +206,14 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 # Start server with Base model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --port 8000 --trust-remote-code --enforce-eager
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
 ```
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, this is a cloned voice",
@@ -212,23 +222,25 @@ curl -X POST http://localhost:8000/v1/audio/speech \
         "ref_text": "Original transcript of the reference audio"
     }' --output cloned.wav
 ```
+
 upload voice
 ```bash
-curl -X POST http://localhost:8000/v1/audio/voices \
+curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1"
 ```
+
 use upload voice
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, this is a cloned voice",
         "task_type": "Base",
         "voice": "custom_voice_1"
     }' --output cloned.wav
-```
+
 ## Supported Models
 
 | Model | Task Type | Description |
@@ -284,7 +296,7 @@ Ensure you're using the correct model variant for your task type:
 
 ```bash
 # Check if server is responding
-curl http://localhost:8000/v1/audio/voices
+curl http://localhost:8091/v1/audio/voices
 ```
 
 ### Out of Memory
@@ -304,5 +316,9 @@ Enable debug logging:
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --omni --uvicorn-log-level debug
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager \
+    --uvicorn-log-level debug
 ```
