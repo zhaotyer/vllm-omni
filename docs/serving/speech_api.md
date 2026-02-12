@@ -164,6 +164,43 @@ curl -X POST http://localhost:8091/v1/audio/voices \
   -F "name=custom_voice_1"
 ```
 
+
+```bash
+DELETE /v1/audio/voices/{name}
+```
+
+Delete an uploaded voice sample.
+
+**Path Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | Yes | Name of the voice to delete |
+
+**Response Example:**
+
+```json
+{
+  "success": true,
+  "message": "Voice 'custom_voice_1' deleted successfully"
+}
+```
+
+**Error Response (404 Not Found):**
+
+```json
+{
+  "success": false,
+  "error": "Voice 'unknown_voice' not found"
+}
+```
+
+**Usage Example:**
+
+```bash
+curl -X DELETE http://localhost:8091/v1/audio/voices/custom_voice_1
+```
+
 ## Examples
 
 ### CustomVoice with Style Instruction

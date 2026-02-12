@@ -869,12 +869,6 @@ async def upload_voice(
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
     try:
-        # Validate required parameters
-        if not consent:
-            return base(raw_request).create_error_response(message="consent is required")
-        if not name:
-            return base(raw_request).create_error_response(message="name is required")
-
         # Upload the voice
         result = await handler.upload_voice(audio_sample, consent, name)
 
@@ -885,6 +879,49 @@ async def upload_voice(
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
         return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+
+
+@router.delete(
+    "/v1/audio/voices/{name}",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def delete_voice(name: str, raw_request: Request):
+    """Delete an uploaded voice.
+
+    Deletes the voice sample and associated metadata. Also removes any
+    cached voice clone prompts for this voice.
+
+    Args:
+        name: Name of the voice to delete
+        raw_request: Raw FastAPI request
+
+    Returns:
+        JSON response indicating success or failure
+    """
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+
+    try:
+        # Delete the voice
+        success = await handler.delete_voice(name)
+        if not success:
+            return JSONResponse(
+                content={"success": False, "error": f"Voice '{name}' not found"},
+                status_code=HTTPStatus.NOT_FOUND.value,
+            )
+
+        return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
+
+    except ValueError as e:
+        return base(raw_request).create_error_response(message=str(e))
+    except Exception as e:
+        logger.exception(f"Failed to delete voice '{name}': {e}")
+        return base(raw_request).create_error_response(message=f"Failed to delete voice: {str(e)}")
 
 
 # Health and Model endpoints for diffusion mode

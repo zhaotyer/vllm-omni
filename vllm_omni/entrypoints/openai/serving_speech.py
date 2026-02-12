@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.metadata_manager import MetadataManager
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     CreateAudio,
@@ -87,15 +88,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.uploaded_speakers_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.uploaded_speakers_dir / "metadata.json"
 
+        # Initialize metadata manager
+        self.metadata_manager = MetadataManager(self.metadata_file)
+
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
-        # Load uploaded speakers
-        self.uploaded_speakers = self._load_uploaded_speakers()
+        # Load uploaded speakers (in-memory cache, will be updated via metadata_manager)
+        self.uploaded_speakers = {}
+        self._refresh_uploaded_speakers_cache()
         # Merge supported speakers with uploaded speakers
         self.supported_speakers.update(self.uploaded_speakers.keys())
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
+
+    def _refresh_uploaded_speakers_cache(self):
+        """Refresh in-memory cache of uploaded speakers from metadata manager."""
+        try:
+            # This runs in __init__, so we can't use async
+            # We'll load directly for initialization, but all updates go through metadata_manager
+            if self.metadata_file.exists():
+                with open(self.metadata_file) as f:
+                    metadata = json.load(f)
+                self.uploaded_speakers = metadata.get("uploaded_speakers", {})
+        except Exception as e:
+            logger.warning(f"Could not refresh uploaded speakers cache: {e}")
+            self.uploaded_speakers = {}
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -114,28 +132,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning(f"Could not load speakers from model config: {e}")
 
         return set()
-
-    def _load_uploaded_speakers(self) -> dict[str, dict]:
-        """Load uploaded speakers from metadata file."""
-        if not self.metadata_file.exists():
-            return {}
-
-        try:
-            with open(self.metadata_file) as f:
-                metadata = json.load(f)
-            return metadata.get("uploaded_speakers", {})
-        except Exception as e:
-            logger.warning(f"Could not load uploaded speakers metadata: {e}")
-            return {}
-
-    def _save_uploaded_speakers(self) -> None:
-        """Save uploaded speakers to metadata file."""
-        try:
-            metadata = {"uploaded_speakers": self.uploaded_speakers}
-            with open(self.metadata_file, "w") as f:
-                json.dump(metadata, f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save uploaded speakers metadata: {e}")
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Get base64 encoded audio data for uploaded voice."""
@@ -250,8 +246,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             raise ValueError(f"Failed to save audio file: {e}")
 
-        # Update metadata
-        self.uploaded_speakers[voice_name_lower] = {
+        # Create speaker data
+        speaker_data = {
             "name": name,
             "consent": consent,
             "file_path": str(file_path),
@@ -259,16 +255,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mime_type": mime_type,
             "original_filename": audio_file.filename,
             "file_size": file_size,
-            "cache_status": "pending",  # 初始缓存状态为 pending
-            "cache_file": None,  # 初始缓存文件为空
-            "cache_generated_at": None,  # 初始缓存生成时间为空
+            "cache_status": "pending",  # The initial cache state is pending.
+            "cache_file": None,  # The initial cache file is empty.
+            "cache_generated_at": None,  # The initial cache generation time is empty.
         }
 
-        # Update supported speakers
-        self.supported_speakers.add(voice_name_lower)
+        # Save metadata using metadata manager (concurrency safe)
+        success = await self.metadata_manager.create_speaker(voice_name_lower, speaker_data)
+        if not success:
+            # Clean up the saved file if metadata creation failed
+            try:
+                file_path.unlink()
+            except Exception:
+                pass
+            raise ValueError(f"Failed to create metadata for voice '{name}' (possibly already exists)")
 
-        # Save metadata
-        self._save_uploaded_speakers()
+        # Update in-memory cache
+        self.uploaded_speakers[voice_name_lower] = speaker_data
+        self.supported_speakers.add(voice_name_lower)
 
         logger.info(f"Uploaded new voice '{name}' with consent ID '{consent}'")
 
@@ -280,6 +284,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mime_type": mime_type,
             "file_size": file_size,
         }
+
+    async def delete_voice(self, name: str) -> bool:
+        """
+        Delete an uploaded voice.
+
+        Args:
+            name: Voice name to delete
+
+        Returns:
+            bool: True if successful, False if voice doesn't exist
+        """
+        voice_name_lower = name.lower()
+
+        # Check if voice exists in memory cache
+        if voice_name_lower not in self.uploaded_speakers:
+            logger.warning(f"Voice '{name}' not found in memory cache")
+            return False
+
+        # Delete from metadata manager with file cleanup
+        # Pass base_dir for path validation
+        deleted_info = self.metadata_manager.delete_speaker(voice_name_lower)
+        if not deleted_info:
+            logger.error(f"Failed to delete voice '{name}' from metadata")
+            return False
+
+        # Update in-memory cache
+        if voice_name_lower in self.uploaded_speakers:
+            del self.uploaded_speakers[voice_name_lower]
+        if voice_name_lower in self.supported_speakers:
+            self.supported_speakers.remove(voice_name_lower)
+
+        logger.info(f"Deleted voice '{name}' and associated files")
+        return True
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -324,13 +361,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # voice is not None
                 voice_lower = request.voice.lower()
                 if voice_lower in self.uploaded_speakers:
-                    pass
+                    # Check if audio file exists for uploaded speaker
+                    speaker_info = self.uploaded_speakers[voice_lower]
+                    file_path = Path(speaker_info["file_path"])
+                    if not file_path.exists():
+                        return f"Audio file for uploaded speaker '{request.voice}' not found on disk"
                 else:
-                    # need ref_audio
+                    # need ref_audio for built-in speaker
                     if request.ref_audio is None:
                         return (
                             f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
                         )
+                    # Validate ref_audio format for built-in speaker
+                    if not (
+                        request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")
+                    ):
+                        return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
