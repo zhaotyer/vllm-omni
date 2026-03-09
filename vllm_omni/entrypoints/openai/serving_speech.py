@@ -1,15 +1,14 @@
 import asyncio
+import base64
 import json
 import math
 import os
 import re
-import socket
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import soundfile as sf
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
@@ -56,7 +55,7 @@ def _sanitize_filename(filename: str) -> str:
     # Remove any path components
     filename = os.path.basename(filename)
     # Replace any non-alphanumeric, underscore, hyphen, or dot with underscore
-    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", filename)
+    sanitized = re.sub(r"[^a-zA-Z0-9_.\-]", "_", filename)
     # Ensure filename is not empty
     if not sanitized:
         sanitized = "file"
@@ -526,7 +525,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         or request.ref_audio.startswith("data:")
                         or request.ref_audio.startswith("file://")
                     ):
-                        return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+                        return (
+                            "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+                        )
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
